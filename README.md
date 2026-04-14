@@ -42,4 +42,4 @@ Comunicação: Bluetooth Low Energy (BLE) / GATT
 Arquitetura: State-driven UI (Material 3)
 
 👤 Autor
-Desenvolvido por Christian — Desenvolvedor Backend e entusiasta de eletrônica/hardware.
+Desenvolvido por Christian — Desenvolvedor FullStack e entusiasta de eletrônica/hardware.
