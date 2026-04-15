@@ -7,6 +7,7 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -38,13 +39,11 @@ import com.CTAP.shellcardebugcontroller.presentation.CarProtocol.toHexString
 import com.CTAP.shellcardebugcontroller.presentation.theme.ShellCarDebugControllerTheme
 import java.util.*
 
-// ── CONFIGURAÇÕES BLE ──
 private val SERVICE_UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
 private val CHAR_UUID    = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
 private val BATTERY_SERVICE_UUID = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
 private val BATTERY_CHAR_UUID    = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
 
-// ── CORES ──
 private val ColorBackground = Color(0xFF0A0A0A)
 private val ColorFerrariRed = Color(0xFFDC143C)
 private val ColorGold       = Color(0xFFFFD700)
@@ -64,15 +63,16 @@ class MainActivity : ComponentActivity() {
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var isScanning = false
 
-    private var motorState     = mutableStateOf(MotorState.PARADO)
-    private var connectionText = mutableStateOf("Buscando…")
-    private var batteryLevel   = mutableStateOf("--")
-    private var lastPacket     = mutableStateOf("-- -- -- -- --")
+    private val motorState     = mutableStateOf(MotorState.PARADO)
+    private val connectionText = mutableStateOf("Buscando…")
+    private val batteryLevel   = mutableStateOf("--")
+    private val lastPacket     = mutableStateOf("-- -- -- -- --")
 
     private var isTurningLeft  by mutableStateOf(false)
     private var isTurningRight by mutableStateOf(false)
     private var steerDir       by mutableStateOf(0)
 
+    @SuppressLint("InlinedApi")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -104,11 +104,8 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun startScanning() {
         if (isScanning) return
-        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        val scanner = adapter.bluetoothLeScanner ?: run {
-            connectionText.value = "BT Desligado"
-            return
-        }
+        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val scanner = manager.adapter.bluetoothLeScanner ?: return
 
         connectionText.value = "Buscando…"
         isScanning = true
@@ -117,7 +114,6 @@ class MainActivity : ComponentActivity() {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        // Scan sem filtro de UUID para máxima compatibilidade
         scanner.startScan(null, settings, scanCallback)
     }
 
@@ -127,11 +123,10 @@ class MainActivity : ComponentActivity() {
             val device = result.device
             val name = device.name ?: ""
 
-            // Filtra por nomes que começam com SL- ou que contenham Shell (opcional)
             if (isScanning && (name.startsWith("SL-") || name.contains("Shell", ignoreCase = true))) {
                 isScanning = false
-                val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-                adapter.bluetoothLeScanner.stopScan(this)
+                val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                manager.adapter.bluetoothLeScanner?.stopScan(this)
                 connectionText.value = "Conectando…"
                 bluetoothGatt = device.connectGatt(this@MainActivity, false, gattCallback)
             }
@@ -155,10 +150,8 @@ class MainActivity : ComponentActivity() {
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val service = gatt.getService(SERVICE_UUID)
-            writeCharacteristic = service?.getCharacteristic(CHAR_UUID)
+            writeCharacteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHAR_UUID)
 
-            // Ativa bateria
             val bService = gatt.getService(BATTERY_SERVICE_UUID)
             bService?.getCharacteristic(BATTERY_CHAR_UUID)?.let { char ->
                 gatt.readCharacteristic(char)
@@ -166,12 +159,26 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicRead(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, status: Int) {
-            if (char.uuid == BATTERY_CHAR_UUID) batteryLevel.value = "${char.value[0].toInt()}%"
+            if (char.uuid == BATTERY_CHAR_UUID && status == BluetoothGatt.GATT_SUCCESS) {
+                val data = char.value
+                if (data != null && data.isNotEmpty()) {
+                    batteryLevel.value = "${data[0].toInt()}%"
+                }
+            }
         }
 
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
-            if (char.uuid == BATTERY_CHAR_UUID) batteryLevel.value = "${char.value[0].toInt()}%"
+            if (char.uuid == BATTERY_CHAR_UUID) {
+                val data = char.value
+                if (data != null && data.isNotEmpty()) {
+                    batteryLevel.value = "${data[0].toInt()}%"
+                }
+            }
         }
     }
 
@@ -195,10 +202,19 @@ class MainActivity : ComponentActivity() {
     private fun sendToCar() {
         val packet = CarProtocol.buildPacket(motorState.value.motor, isTurningLeft, isTurningRight)
         lastPacket.value = packet.toHexString()
-        writeCharacteristic?.let { char ->
+
+        val gatt = bluetoothGatt ?: return
+        val char = writeCharacteristic ?: return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(char, packet, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+        } else {
+            @Suppress("DEPRECATION")
             char.value = packet
+            @Suppress("DEPRECATION")
             char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            bluetoothGatt?.writeCharacteristic(char)
+            @Suppress("DEPRECATION")
+            gatt.writeCharacteristic(char)
         }
     }
 }
