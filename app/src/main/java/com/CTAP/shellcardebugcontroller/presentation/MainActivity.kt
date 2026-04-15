@@ -15,13 +15,10 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.text.TextStyle
@@ -43,13 +40,17 @@ private const val CAR_MAC_ADDRESS = "13:05:AA:02:4E:0B"
 private val SERVICE_UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
 private val CHAR_UUID    = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
 
-// ── Paleta Ferrari ─────────────────────────────────────────────────────────────
-private val ColorBackground  = Color(0xFF0A0A0A)
-private val ColorFerrariRed  = Color(0xFFDC143C)
-private val ColorGold        = Color(0xFFFFD700)
-private val ColorGreen       = Color(0xFF00E676)
-private val ColorGray        = Color(0xFF444444)
-private val ColorDimText     = Color(0xFF555555)
+// UUIDs de Bateria (Standard Bluetooth SIG)
+private val BATTERY_SERVICE_UUID = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
+private val BATTERY_CHAR_UUID    = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
+
+// ── Paleta de Cores ────────────────────────────────────────────────────────────
+private val ColorBackground = Color(0xFF0A0A0A)
+private val ColorFerrariRed = Color(0xFFDC143C)
+private val ColorGold       = Color(0xFFFFD700)
+private val ColorGreen      = Color(0xFF00E676)
+private val ColorGray       = Color(0xFF444444)
+private val ColorDimText    = Color(0xFF555555)
 
 enum class MotorState(val label: String, val color: Color, val motor: Byte) {
     PARADO ("PARAR",  ColorFerrariRed, MOTOR_STOP),
@@ -64,6 +65,7 @@ class MainActivity : ComponentActivity() {
 
     private var motorState     = mutableStateOf(MotorState.PARADO)
     private var connectionText = mutableStateOf("Conectando…")
+    private var batteryLevel   = mutableStateOf("--")
     private var lastPacket     = mutableStateOf("-- -- -- -- --")
     private var steerDir       = mutableStateOf(0)
     private var isTurningLeft  = false
@@ -71,13 +73,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        ActivityCompat.requestPermissions(
-            this,
-            arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION),
-            1
-        )
-
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION), 1)
         connectToCar()
 
         setContent {
@@ -85,9 +81,10 @@ class MainActivity : ComponentActivity() {
                 FerrariControlScreen(
                     currentMotorState = motorState.value,
                     connectionText    = connectionText.value,
-                    lastPacket       = lastPacket.value,
-                    steerDir         = steerDir.value,
-                    onStateSelected  = { newState ->
+                    batteryLevel      = batteryLevel.value,
+                    lastPacket        = lastPacket.value,
+                    steerDir          = steerDir.value,
+                    onStateSelected   = { newState ->
                         motorState.value = newState
                         sendToCar()
                     }
@@ -100,43 +97,55 @@ class MainActivity : ComponentActivity() {
     private fun connectToCar() {
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         try {
-            bluetoothGatt = adapter.getRemoteDevice(CAR_MAC_ADDRESS)
-                .connectGatt(this, false, gattCallback)
-        } catch (e: Exception) {
-            connectionText.value = "Erro de MAC"
-        }
+            bluetoothGatt = adapter.getRemoteDevice(CAR_MAC_ADDRESS).connectGatt(this, false, gattCallback)
+        } catch (e: Exception) { connectionText.value = "Erro MAC" }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             connectionText.value = when (newState) {
-                BluetoothProfile.STATE_CONNECTED    -> { gatt.discoverServices(); "● Conectado" }
-                BluetoothProfile.STATE_DISCONNECTED -> "○ Desconectado"
-                else                                -> "○ Aguardando"
+                BluetoothProfile.STATE_CONNECTED -> { gatt.discoverServices(); "● ON" }
+                BluetoothProfile.STATE_DISCONNECTED -> { batteryLevel.value = "--"; "○ OFF" }
+                else -> "○ ..."
             }
         }
+
+        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             writeCharacteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHAR_UUID)
+
+            // Ativa monitoramento de bateria
+            val bService = gatt.getService(BATTERY_SERVICE_UUID)
+            val bChar = bService?.getCharacteristic(BATTERY_CHAR_UUID)
+            bChar?.let {
+                gatt.readCharacteristic(it)
+                gatt.setCharacteristicNotification(it, true)
+            }
+        }
+
+        override fun onCharacteristicRead(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, status: Int) {
+            if (char.uuid == BATTERY_CHAR_UUID) {
+                batteryLevel.value = "${char.value[0].toInt()}%"
+            }
+        }
+
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
+            if (char.uuid == BATTERY_CHAR_UUID) {
+                batteryLevel.value = "${char.value[0].toInt()}%"
+            }
         }
     }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_SCROLL &&
-            event.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
-
+        if (event.action == MotionEvent.ACTION_SCROLL && event.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
             val delta = -event.getAxisValue(MotionEvent.AXIS_SCROLL)
             isTurningRight = delta > 0
             isTurningLeft  = delta < 0
             steerDir.value  = if (delta > 0) 1 else -1
-
             sendToCar()
-
             Handler(Looper.getMainLooper()).postDelayed({
-                isTurningLeft  = false
-                isTurningRight = false
-                steerDir.value  = 0
-                sendToCar()
+                isTurningLeft = false; isTurningRight = false; steerDir.value = 0; sendToCar()
             }, 300)
             return true
         }
@@ -145,17 +154,11 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun sendToCar() {
-        val packet = CarProtocol.buildPacket(
-            motor = motorState.value.motor,
-            left  = isTurningLeft,
-            right = isTurningRight
-        )
+        val packet = CarProtocol.buildPacket(motorState.value.motor, isTurningLeft, isTurningRight)
         lastPacket.value = packet.toHexString()
-
-        writeCharacteristic?.let { char ->
-            char.value     = packet
-            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            bluetoothGatt?.writeCharacteristic(char)
+        writeCharacteristic?.let {
+            it.value = packet
+            bluetoothGatt?.writeCharacteristic(it)
         }
     }
 }
@@ -164,101 +167,62 @@ class MainActivity : ComponentActivity() {
 fun FerrariControlScreen(
     currentMotorState: MotorState,
     connectionText: String,
+    batteryLevel: String,
     lastPacket: String,
     steerDir: Int,
     onStateSelected: (MotorState) -> Unit
 ) {
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(ColorBackground),
+        modifier = Modifier.fillMaxSize().background(ColorBackground).padding(14.dp),
         contentAlignment = Alignment.Center
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Text(
-                text = connectionText,
-                color = if (connectionText.startsWith("●")) ColorGreen else ColorDimText,
-                fontSize = 8.sp,
-                letterSpacing = 1.sp
-            )
 
-            Spacer(modifier = Modifier.height(4.dp))
-
-            // ── Grade de Botões ─────────────────────────────────────────────
-
-            // Botão FRENTE (Topo)
-            MotorButton(
-                state = MotorState.FRENTE,
-                isSelected = currentMotorState == MotorState.FRENTE,
-                onClick = { onStateSelected(MotorState.FRENTE) }
-            )
-
+            // Status e Bateria (Com padding horizontal para evitar corte lateral)
             Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
-                // Botão PARAR (Esquerda)
-                MotorButton(
-                    state = MotorState.PARADO,
-                    isSelected = currentMotorState == MotorState.PARADO,
-                    onClick = { onStateSelected(MotorState.PARADO) }
-                )
-
-                // Botão RÉ (Direita)
-                MotorButton(
-                    state = MotorState.RE,
-                    isSelected = currentMotorState == MotorState.RE,
-                    onClick = { onStateSelected(MotorState.RE) }
-                )
-            }
-
-            // ── Direção ─────────────────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("◄", color = if (steerDir == -1) ColorGold else ColorDimText)
-                Text(lastPacket, color = ColorGold.copy(0.5f), fontSize = 7.sp)
-                Text("►", color = if (steerDir == 1) ColorGold else ColorDimText)
+                Text(text = connectionText, color = if (connectionText.contains("●")) ColorGreen else ColorDimText, fontSize = 9.sp)
+                Text(text = "🔋 $batteryLevel", color = if (batteryLevel == "--") ColorDimText else ColorGreen, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Botão FRENTE
+            MotorButton(MotorState.FRENTE, currentMotorState == MotorState.FRENTE) { onStateSelected(MotorState.FRENTE) }
+
+            // Botões PARADO e RÉ
+            Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                MotorButton(MotorState.PARADO, currentMotorState == MotorState.PARADO) { onStateSelected(MotorState.PARADO) }
+                MotorButton(MotorState.RE, currentMotorState == MotorState.RE) { onStateSelected(MotorState.RE) }
+            }
+
+            // Direção e Pacote
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("◄", color = if (steerDir == -1) ColorGold else ColorDimText, fontSize = 12.sp)
+                Text(text = lastPacket, color = ColorGold.copy(0.35f), fontSize = 7.sp, textAlign = TextAlign.Center)
+                Text("►", color = if (steerDir == 1) ColorGold else ColorDimText, fontSize = 12.sp)
             }
         }
     }
 }
 
 @Composable
-fun MotorButton(
-    state: MotorState,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
+fun MotorButton(state: MotorState, isSelected: Boolean, onClick: () -> Unit) {
     val color = if (isSelected) state.color else ColorGray
-    val alpha = if (isSelected) 1f else 0.4f
-
     Button(
         onClick = onClick,
         modifier = Modifier
-            .size(width = 75.dp, height = 42.dp)
-            .border(
-                width = if (isSelected) 2.dp else 1.dp,
-                color = color.copy(alpha = alpha),
-                shape = RoundedCornerShape(20.dp)
-            ),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (isSelected) state.color.copy(0.2f) else Color.Transparent
-        )
+            .size(width = 78.dp, height = 42.dp)
+            .border(width = if (isSelected) 2.dp else 1.dp, color = color.copy(alpha = if (isSelected) 1f else 0.3f), shape = RoundedCornerShape(21.dp)),
+        colors = ButtonDefaults.buttonColors(containerColor = if (isSelected) state.color.copy(0.15f) else Color.Transparent)
     ) {
-        Text(
-            text = state.label,
-            color = color,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Black,
-            style = TextStyle(
-                shadow = if (isSelected) Shadow(color.copy(0.8f), blurRadius = 8f) else null
-            )
-        )
+        Text(text = state.label, color = color, fontSize = 9.sp, fontWeight = FontWeight.Black, style = TextStyle(shadow = if (isSelected) Shadow(color.copy(0.8f), blurRadius = 8f) else null))
     }
 }
