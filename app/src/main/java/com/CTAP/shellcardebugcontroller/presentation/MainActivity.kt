@@ -3,6 +3,9 @@ package com.CTAP.shellcardebugcontroller.presentation
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.*
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Bundle
 import android.os.Handler
@@ -35,12 +38,13 @@ import com.CTAP.shellcardebugcontroller.presentation.CarProtocol.toHexString
 import com.CTAP.shellcardebugcontroller.presentation.theme.ShellCarDebugControllerTheme
 import java.util.*
 
-private const val CAR_MAC_ADDRESS = "13:05:AA:02:4E:0B"
+// ── CONFIGURAÇÕES BLE ──
 private val SERVICE_UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
 private val CHAR_UUID    = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
 private val BATTERY_SERVICE_UUID = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
 private val BATTERY_CHAR_UUID    = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
 
+// ── CORES ──
 private val ColorBackground = Color(0xFF0A0A0A)
 private val ColorFerrariRed = Color(0xFFDC143C)
 private val ColorGold       = Color(0xFFFFD700)
@@ -58,9 +62,10 @@ class MainActivity : ComponentActivity() {
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var isScanning = false
 
     private var motorState     = mutableStateOf(MotorState.PARADO)
-    private var connectionText = mutableStateOf("Conectando…")
+    private var connectionText = mutableStateOf("Buscando…")
     private var batteryLevel   = mutableStateOf("--")
     private var lastPacket     = mutableStateOf("-- -- -- -- --")
 
@@ -70,8 +75,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION), 1)
-        connectToCar()
+
+        ActivityCompat.requestPermissions(this, arrayOf(
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ), 1)
+
+        startScanning()
 
         setContent {
             ShellCarDebugControllerTheme {
@@ -81,7 +92,7 @@ class MainActivity : ComponentActivity() {
                     batteryLevel      = batteryLevel.value,
                     lastPacket        = lastPacket.value,
                     steerDir          = steerDir,
-                    onStateSelected   = { newState ->
+                    onStateSelected   = { newState: MotorState ->
                         motorState.value = newState
                         sendToCar()
                     }
@@ -91,43 +102,76 @@ class MainActivity : ComponentActivity() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectToCar() {
+    private fun startScanning() {
+        if (isScanning) return
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        try {
-            bluetoothGatt = adapter.getRemoteDevice(CAR_MAC_ADDRESS).connectGatt(this, false, gattCallback)
-        } catch (e: Exception) { connectionText.value = "Erro MAC" }
+        val scanner = adapter.bluetoothLeScanner ?: run {
+            connectionText.value = "BT Desligado"
+            return
+        }
+
+        connectionText.value = "Buscando…"
+        isScanning = true
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        // Scan sem filtro de UUID para máxima compatibilidade
+        scanner.startScan(null, settings, scanCallback)
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val device = result.device
+            val name = device.name ?: ""
+
+            // Filtra por nomes que começam com SL- ou que contenham Shell (opcional)
+            if (isScanning && (name.startsWith("SL-") || name.contains("Shell", ignoreCase = true))) {
+                isScanning = false
+                val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+                adapter.bluetoothLeScanner.stopScan(this)
+                connectionText.value = "Conectando…"
+                bluetoothGatt = device.connectGatt(this@MainActivity, false, gattCallback)
+            }
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            connectionText.value = when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> { gatt.discoverServices(); "● ON" }
-                BluetoothProfile.STATE_DISCONNECTED -> { batteryLevel.value = "--"; "○ OFF" }
-                else -> "○ ..."
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                connectionText.value = "● ON"
+                gatt.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                connectionText.value = "○ OFF"
+                batteryLevel.value = "--"
+                bluetoothGatt = null
+                writeCharacteristic = null
+                startScanning()
             }
         }
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            writeCharacteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHAR_UUID)
-            val bChar = gatt.getService(BATTERY_SERVICE_UUID)?.getCharacteristic(BATTERY_CHAR_UUID)
-            bChar?.let {
-                gatt.readCharacteristic(it)
-                gatt.setCharacteristicNotification(it, true)
+            val service = gatt.getService(SERVICE_UUID)
+            writeCharacteristic = service?.getCharacteristic(CHAR_UUID)
+
+            // Ativa bateria
+            val bService = gatt.getService(BATTERY_SERVICE_UUID)
+            bService?.getCharacteristic(BATTERY_CHAR_UUID)?.let { char ->
+                gatt.readCharacteristic(char)
+                gatt.setCharacteristicNotification(char, true)
             }
         }
 
         override fun onCharacteristicRead(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, status: Int) {
-            if (char.uuid == BATTERY_CHAR_UUID) {
-                batteryLevel.value = "${char.value[0].toInt()}%"
-            }
+            if (char.uuid == BATTERY_CHAR_UUID) batteryLevel.value = "${char.value[0].toInt()}%"
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
-            if (char.uuid == BATTERY_CHAR_UUID) {
-                batteryLevel.value = "${char.value[0].toInt()}%"
-            }
+            if (char.uuid == BATTERY_CHAR_UUID) batteryLevel.value = "${char.value[0].toInt()}%"
         }
     }
 
@@ -137,15 +181,10 @@ class MainActivity : ComponentActivity() {
             isTurningRight = delta > 0
             isTurningLeft  = delta < 0
             steerDir = if (delta > 0) 1 else -1
-
             sendToCar()
-
             Handler(Looper.getMainLooper()).removeCallbacksAndMessages(null)
             Handler(Looper.getMainLooper()).postDelayed({
-                isTurningLeft = false
-                isTurningRight = false
-                steerDir = 0
-                sendToCar()
+                isTurningLeft = false; isTurningRight = false; steerDir = 0; sendToCar()
             }, 400)
             return true
         }
@@ -154,16 +193,12 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun sendToCar() {
-        val packet = CarProtocol.buildPacket(
-            motor = motorState.value.motor,
-            left = isTurningLeft,
-            right = isTurningRight
-        )
-
+        val packet = CarProtocol.buildPacket(motorState.value.motor, isTurningLeft, isTurningRight)
         lastPacket.value = packet.toHexString()
-        writeCharacteristic?.let {
-            it.value = packet
-            bluetoothGatt?.writeCharacteristic(it)
+        writeCharacteristic?.let { char ->
+            char.value = packet
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            bluetoothGatt?.writeCharacteristic(char)
         }
     }
 }
@@ -179,21 +214,16 @@ fun FerrariControlScreen(
 ) {
     Box(modifier = Modifier.fillMaxSize().background(ColorBackground).padding(14.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center, modifier = Modifier.fillMaxWidth()) {
-
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(text = connectionText, color = if (connectionText.contains("●")) ColorGreen else ColorDimText, fontSize = 9.sp)
                 Text(text = "🔋 $batteryLevel", color = if (batteryLevel == "--") ColorDimText else ColorGreen, fontSize = 9.sp, fontWeight = FontWeight.Bold)
             }
-
             Spacer(modifier = Modifier.height(10.dp))
-
             MotorButton(MotorState.FRENTE, currentMotorState == MotorState.FRENTE) { onStateSelected(MotorState.FRENTE) }
-
             Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                 MotorButton(MotorState.PARADO, currentMotorState == MotorState.PARADO) { onStateSelected(MotorState.PARADO) }
                 MotorButton(MotorState.RE, currentMotorState == MotorState.RE) { onStateSelected(MotorState.RE) }
             }
-
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("◄", color = if (steerDir == -1) ColorGold else ColorDimText, fontSize = 12.sp)
                 Text(text = lastPacket, color = ColorGold.copy(0.35f), fontSize = 7.sp, textAlign = TextAlign.Center)
